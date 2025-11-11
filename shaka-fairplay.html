@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+
+    <link rel="icon" href="https://assets.gumlet.io/assets/round-logo.png?w=32" sizes="32x32" />
+    <link rel="icon" href="https://assets.gumlet.io/assets/round-logo.png?w=192" sizes="192x192" />
+    <link rel="apple-touch-icon-precomposed" href="https://assets.gumlet.io/assets/round-logo.png?w=180" />
+    <meta name="msapplication-TileImage" content="https://assets.gumlet.io/assets/round-logo.png?w=270" />
+
+    <title>Shaka Player Fairplay</title>
+    <script
+        src="https://cdnjs.cloudflare.com/ajax/libs/shaka-player/4.16.3/shaka-player.compiled.debug.min.js"></script>
+    <script type="text/javascript">
+        /* ====== CONFIG - Replace these ====== */
+        const FAIRPLAY_CERT_URL = '<Fairplay certificate>';
+        const FAIRPLAY_LICENSE_URL = '<Fairplay license URL>';
+        const HLS_MANIFEST_URL = '<HLS manifest URL>';
+        /* =================================== */
+
+          function uint8ToBase64(u8) {
+                // chunk to avoid call stack limits
+                const CHUNK = 0x8000;
+                let index = 0;
+                let result = "";
+                while (index < u8.length) {
+                const sub = u8.subarray(index, Math.min(index + CHUNK, u8.length));
+                result += String.fromCharCode.apply(null, Array.from(sub));
+                index += CHUNK;
+                }
+                // btoa operates on binary string -> base64
+                return btoa(result);
+            }
+
+        const basicInitDataTransform = (initData, initDataType, drmInfo) => {
+            if (initDataType !== 'skd') {
+                return initData;
+            }
+            const StringUtils = shaka.util.StringUtils;
+            const cert = drmInfo.serverCertificate;
+            const initDataAsString = StringUtils.fromBytesAutoDetect(initData);
+            const contentId = initDataAsString.split('skd://').pop();
+            return shaka.drm.FairPlay.initDataTransform(initData, contentId, cert);
+        }
+
+        const loadVideoWithFairplay = async (player, signedLicenseUrl) => {
+            const certificateUrl = FAIRPLAY_CERT_URL;
+
+            // 1) load certificate
+            // let certificateBuffer = null;
+            // try {
+            //     const response = await fetch(certificateUrl);
+            //     if (!response.ok) throw new Error(`CERT fetch failed ${response.status}`);
+            //     certificateBuffer = await response.arrayBuffer();
+            //     console.info('FairPlay certificate fetched, bytes=', certificateBuffer.byteLength);
+            // } catch (err) {
+            //     console.error('Could not load certificate at', certificateUrl, err);
+            //     throw err; // don't continue if no certificate
+            // }
+
+            // 2) configure DRM (serverCertificate must be Uint8Array)
+            await player.configure({
+                drm: {
+                    servers: {
+                        'com.widevine.alpha': 'https://foo.bar/drm/widevine',
+                        'com.apple.fps': signedLicenseUrl
+                    },
+                    advanced: {
+                        'com.apple.fps': {
+                            // 'videoRobustness': [''],
+                            // 'audioRobustness': [''],
+                            serverCertificateUri: certificateUrl
+                        }
+                    }
+                }
+            });
+            // player.configure('drm.advanced.com\\.apple\\.fps.serverCertificateUri',
+            //      certificateUrl);
+            // player.configure('drm.servers.com\\.apple\\.fps',
+            //      signedLicenseUrl);
+            // player.configure({
+            //     drm: {
+            //         servers: {
+            //         [FAIRPLAY_SERVER_KEY]: signedLicenseUrl,
+            //         },
+            //         advanced: {
+            //         [FAIRPLAY_SERVER_KEY]: {
+            //             serverCertificateUri: certificateUrl,
+            //             serverCertificate: new Uint8Array(certificateBuffer),
+            //         },
+            //         },
+            //     },
+            // });
+
+            // await player.configure('drm.initDataTransform', basicInitDataTransform);
+
+            // license state for diagnostics/optional blocking behavior
+            let licenseRequestCount = 0;
+            let lastLicenseSucceeded = false;
+
+            // 3) register request filter (license + log everything)
+            player.getNetworkingEngine().registerRequestFilter((type, request) => {
+
+                if (type !== shaka.net.NetworkingEngine.RequestType.LICENSE) {
+                    // Nothing to change for non-license requests.
+                    return;
+                }
+
+                // If request.body is ArrayBuffer from Shaka containing the SPC, base64 it properly
+                if (request.body) {
+                    const originalPayload = new Uint8Array(request.body);
+                    const spc_base64 = uint8ToBase64(originalPayload);
+                    // Replace body with JSON wrapper expected by your license backend
+                    request.headers['Content-Type'] = 'application/json';
+                    request.body = JSON.stringify({ spc: spc_base64 });
+                    licenseRequestCount += 1;
+                    lastLicenseSucceeded = false;
+                    console.debug(`[LicenseRequest] #${licenseRequestCount} spc_len=${spc_base64.length}`);
+                } else {
+                    console.warn('[LicenseRequest] no body present on license request');
+                }
+            });
+
+            // 4) register response filter (license responses)
+            player.getNetworkingEngine().registerResponseFilter((type, response) => {
+                console.log("registerResponseFilter", type, response, shaka.net.NetworkingEngine.RequestType)
+                if (type !== shaka.net.NetworkingEngine.RequestType.LICENSE) {
+                    return;
+                }
+
+                // Response data may already be ArrayBuffer; try to extract CKC robustly
+                try {
+                    const responseData = response.data;
+                    let responseText = shaka.util.StringUtils.fromUTF8(response.data);
+                    let ckcBase64 = JSON.parse(responseText).ckc;
+                    if (!ckcBase64) {
+                        console.error('[LicenseResponse] Could not find CKC in license response; raw len=', (responseData && responseData.byteLength) || 'unknown');
+                        return;
+                    }
+                    // Convert base64 CKC to Uint8Array and set response.data to the binary buffer
+                    response.data = shaka.util.Uint8ArrayUtils.fromBase64(ckcBase64).buffer;
+                    lastLicenseSucceeded = true;
+                    console.debug(`[LicenseResponse] CKC len=${response.data.byteLength}`);
+                } catch (err) {
+                    console.error('[LicenseResponse] Parsing/decoding error', err);
+                }
+            });
+
+            // done configuring DRM and filters — now return so caller can safely call player.load()
+            console.info('FairPlay filters & DRM configured; ready to load manifest');
+        };
+
+        function initApp() {
+            // Install built-in polyfills to patch browser incompatibilities.
+            shaka && shaka.polyfill.installAll();
+
+            // Check to see if the browser supports the basic APIs Shaka needs.
+            if (shaka && shaka.Player.isBrowserSupported()) {
+                // Everything looks good!
+                initPlayer();
+            } else {
+                // This browser does not have the minimum set of APIs we need.
+                console.error("Browser not supported!");
+            }
+        }
+
+        async function initPlayer() {
+            const video = document.getElementById('player');
+            video.addEventListener("error", (event) => {
+                console.error("Error in video element", event);
+            });
+            if (!video) {
+                console.error("Video element not found")
+                return
+            };
+
+            const player = new shaka.Player();
+            await player.attach(video);
+            
+            player.addEventListener("error", (event) => {
+                console.error("Error on shaka", event.detail);
+            });
+            
+            shaka && shaka?.log?.setLevel?.(shaka.log.Level.DEBUG);
+
+            await loadVideoWithFairplay(player, FAIRPLAY_LICENSE_URL);
+            player.load(HLS_MANIFEST_URL).then(() => {
+                video.play()
+            }).catch(function (err) {
+                console.error("Error loading manifest", err);
+            });
+        }
+
+        document.addEventListener('DOMContentLoaded', function () {
+            initApp()
+        });
+
+
+    </script>
+</head>
+
+<body>
+    <div style="width: 400px">
+
+        <video id="player" width="640" controls></video>
+
+    </div>
+
+
+
+</body>
+
+</html>
