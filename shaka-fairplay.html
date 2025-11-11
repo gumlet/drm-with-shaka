@@ -16,7 +16,9 @@
         /* ====== CONFIG - Replace these ====== */
         const FAIRPLAY_CERT_URL = '<Fairplay certificate>';
         const FAIRPLAY_LICENSE_URL = '<Fairplay license URL>';
-        const HLS_MANIFEST_URL = '<HLS manifest URL>';
+        const WIDEVINE_LICENSE_URL = '<Widevine license URL>';
+        
+            const HLS_MANIFEST_URL = '<HLS manifest URL>';
         /* =================================== */
 
           function uint8ToBase64(u8) {
@@ -47,40 +49,23 @@
         const loadVideoWithFairplay = async (player, signedLicenseUrl) => {
             const certificateUrl = FAIRPLAY_CERT_URL;
 
-            // 1) load certificate
-            // let certificateBuffer = null;
-            // try {
-            //     const response = await fetch(certificateUrl);
-            //     if (!response.ok) throw new Error(`CERT fetch failed ${response.status}`);
-            //     certificateBuffer = await response.arrayBuffer();
-            //     console.info('FairPlay certificate fetched, bytes=', certificateBuffer.byteLength);
-            // } catch (err) {
-            //     console.error('Could not load certificate at', certificateUrl, err);
-            //     throw err; // don't continue if no certificate
-            // }
-
-            // 2) configure DRM (serverCertificate must be Uint8Array)
             await player.configure({
                 drm: {
                     servers: {
-                        'com.widevine.alpha': 'https://foo.bar/drm/widevine',
-                        'com.apple.fps': signedLicenseUrl
+                        'com.widevine.alpha': `${WIDEVINE_LICENSE_URL}`,
+                        'com.apple.fps': `${signedLicenseUrl}`
                     },
                     advanced: {
                         'com.apple.fps': {
-                            // 'videoRobustness': [''],
-                            // 'audioRobustness': [''],
                             serverCertificateUri: certificateUrl
                         }
                     }
                 }
             });
 
-            // license state for diagnostics/optional blocking behavior
             let licenseRequestCount = 0;
             let lastLicenseSucceeded = false;
 
-            // 3) register request filter (license + log everything)
             player.getNetworkingEngine().registerRequestFilter((type, request) => {
 
                 if (type !== shaka.net.NetworkingEngine.RequestType.LICENSE) {
@@ -103,7 +88,7 @@
                 }
             });
 
-            // 4) register response filter (license responses)
+            // register response filter (license responses)
             player.getNetworkingEngine().registerResponseFilter((type, response) => {
                 console.log("registerResponseFilter", type, response, shaka.net.NetworkingEngine.RequestType)
                 if (type !== shaka.net.NetworkingEngine.RequestType.LICENSE) {
